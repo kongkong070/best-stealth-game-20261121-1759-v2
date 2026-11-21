@@ -1,86 +1,61 @@
-// Velvet Shadow — guard brains: patrol routes, vision cones, suspicion,
-// investigation and chase. A guard never knows where the player is unless
-// it saw or heard them; everything else is a patrol.
+// Velvet Shadow — guard patrols, vision cones and the detection meter.
+// A guard patrols waypoints, grows suspicious when it glimpses the player,
+// and gives chase when the meter fills. Break line of sight and the guard
+// cools off: the player can always recover from a near miss.
 import {
-  TILE,
-  GUARD_PATROL_SPEED,
-  GUARD_INVESTIGATE_SPEED,
-  GUARD_CHASE_SPEED,
-  GUARD_VIEW_RANGE,
-  GUARD_VIEW_HALF_ANGLE,
   DETECT_BASE_RATE,
-  DETECT_CLOSE_MULT,
-  DETECT_FAR_MULT,
-  DETECT_RUN_MULT,
-  DETECT_SNEAK_MULT,
-  DETECT_LIGHT_MULT,
-  DETECT_DARK_MULT,
-  DETECT_DECAY_RATE,
+  DETECT_DECAY,
+  CHASE_DECAY,
+  CHASE_AT,
   SUSPICIOUS_AT,
-  ALERT_AT,
-  LOSE_TRACK_AFTER,
-  CATCH_DISTANCE,
-  HEAR_RUN_RADIUS,
-  HEAR_PEBBLE_RADIUS,
+  GUARD_CHASE_SPEED,
+  GUARD_PATROL_SPEED,
+  GUARD_SUSPICIOUS_SPEED,
+  GUARD_TURN_SPEED,
+  GUARD_VIEW_HALF_ANGLE,
+  GUARD_VIEW_RANGE,
+  LIGHT_LAMP,
+  LIGHT_SHADOW,
+  LOSE_SIGHT_SECONDS,
+  MOVE_IDLE,
+  MOVE_RUN,
+  MOVE_SNEAK,
+  MOVE_WALK,
+  TILE,
 } from './config.js';
-import { isSolidTile, isLitTile, isShadowTile, isHidingTile } from './level.js';
+import { isSolidPx, lightAt, tileCenter } from './level.js';
 
-export const GUARD_STATE = {
-  PATROL: 'patrol',
-  SUSPICIOUS: 'suspicious',
-  CHASE: 'chase',
-};
+export function createGuards(def, level) {
+  return def.guards.map((g) => {
+    const first = tileCenter(g.waypoints[0][0], g.waypoints[0][1]);
+    const second = tileCenter(g.waypoints[1][0], g.waypoints[1][1]);
+    return {
+      x: first.x,
+      y: first.y,
+      dir: Math.atan2(second.y - first.y, second.x - first.x),
+      waypoints: g.waypoints.map(([c, r]) => tileCenter(c, r)),
+      waypointIndex: 1,
+      state: 'patrol', // patrol | suspicious | investigate | chase
+      meter: 0,
+      lastSeen: null,
+      investigateTarget: null,
+      pauseTimer: 0,
+      lookTimer: 0,
+      loseTimer: 0,
+      level,
+    };
+  });
+}
 
-// A step of 6 px along a sight line is fine enough to catch a wall tile.
-function lineBlocked(grid, x0, y0, x1, y1) {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const dist = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(dist / 6));
+// Step along the segment in small hops; a solid tile anywhere blocks sight.
+export function hasLineOfSight(level, x0, y0, x1, y1) {
+  const dist = Math.hypot(x1 - x0, y1 - y0);
+  const steps = Math.max(1, Math.ceil(dist / 4));
   for (let i = 1; i < steps; i += 1) {
     const t = i / steps;
-    const tx = Math.floor((x0 + dx * t) / TILE);
-    const ty = Math.floor((y0 + dy * t) / TILE);
-    if (isSolidTile(grid, tx, ty)) return true;
+    if (isSolidPx(level, x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) return false;
   }
-  return false;
-}
-
-// Cast one ray of the vision cone until it hits a wall or runs out of range.
-export function castVisionRay(grid, x, y, angle, maxDist) {
-  const step = 5;
-  let d = step;
-  while (d < maxDist) {
-    const px = x + Math.cos(angle) * d;
-    const py = y + Math.sin(angle) * d;
-    if (isSolidTile(grid, Math.floor(px / TILE), Math.floor(py / TILE))) break;
-    d += step;
-  }
-  return Math.min(d, maxDist);
-}
-
-export function makeGuard(patrol, index) {
-  const first = patrol[0];
-  return {
-    index,
-    patrol,
-    waypoint: 1 % patrol.length,
-    x: (first.x + 0.5) * TILE,
-    y: (first.y + 0.5) * TILE,
-    facing: 0,
-    state: GUARD_STATE.PATROL,
-    awareness: 0, // 0..100 detection meter for this guard
-    lastSeen: null, // {x, y} where the player was last spotted
-    lastHeard: null, // {x, y} of a noise worth checking
-    lookTimer: 0, // seconds spent looking around at an investigation point
-    loseTimer: 0, // seconds the player has stayed out of sight while chased
-    paused: 0, // seconds to stand still at a waypoint (patrol rhythm)
-    stepPhase: Math.random() * Math.PI * 2,
-  };
-}
-
-function angleTo(ax, ay, bx, by) {
-  return Math.atan2(by - ay, bx - ax);
+  return true;
 }
 
 function angleDiff(a, b) {
@@ -90,136 +65,176 @@ function angleDiff(a, b) {
   return d;
 }
 
-function moveToward(guard, tx, ty, speed, dt) {
-  const dx = tx - guard.x;
-  const dy = ty - guard.y;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 1) return true;
-  const step = Math.min(dist, speed * dt);
-  guard.x += (dx / dist) * step;
-  guard.y += (dy / dist) * step;
-  guard.facing = angleTo(0, 0, dx, dy);
-  return dist - step < 2;
+function turnToward(guard, targetDir, dt) {
+  const diff = angleDiff(targetDir, guard.dir);
+  const step = Math.max(-GUARD_TURN_SPEED * dt, Math.min(GUARD_TURN_SPEED * dt, diff));
+  guard.dir += step;
 }
 
-// Can this guard see the player right now? Hiding in a planter always wins.
-export function guardSeesPlayer(guard, player, grid) {
+export function guardSeesPlayer(guard, player, level) {
   if (player.hidden) return false;
   const dx = player.x - guard.x;
   const dy = player.y - guard.y;
   const dist = Math.hypot(dx, dy);
   if (dist > GUARD_VIEW_RANGE) return false;
-  const toPlayer = angleTo(guard.x, guard.y, player.x, player.y);
-  if (Math.abs(angleDiff(toPlayer, guard.facing)) > GUARD_VIEW_HALF_ANGLE) return false;
-  if (lineBlocked(grid, guard.x, guard.y, player.x, player.y)) return false;
-  return true;
+  if (Math.abs(angleDiff(Math.atan2(dy, dx), guard.dir)) > GUARD_VIEW_HALF_ANGLE) return false;
+  return hasLineOfSight(level, guard.x, guard.y, player.x, player.y);
 }
 
-// How fast the meter rises while this guard watches the player.
-function detectionRate(guard, player, grid) {
+// How fast the meter climbs while this guard watches the player.
+function detectionRate(guard, player, level) {
   const dist = Math.hypot(player.x - guard.x, player.y - guard.y);
-  let rate = DETECT_BASE_RATE;
-  if (dist < 80) rate *= DETECT_CLOSE_MULT;
-  else if (dist > 160) rate *= DETECT_FAR_MULT;
-  if (player.running) rate *= DETECT_RUN_MULT;
-  if (player.sneaking) rate *= DETECT_SNEAK_MULT;
-  const tx = Math.floor(player.x / TILE);
-  const ty = Math.floor(player.y / TILE);
-  if (isLitTile(grid, tx, ty)) rate *= DETECT_LIGHT_MULT;
-  if (isShadowTile(grid, tx, ty)) rate *= DETECT_DARK_MULT;
-  return rate;
+  const closeness = 1.15 - (dist / GUARD_VIEW_RANGE);
+  const light = lightAt(level, player.x, player.y);
+  const lightFactor = light === 'lamp' ? LIGHT_LAMP : light === 'shadow' ? LIGHT_SHADOW : 1;
+  const moveFactor = player.sneaking ? MOVE_SNEAK
+    : player.running ? MOVE_RUN
+    : player.moving ? MOVE_WALK : MOVE_IDLE;
+  return DETECT_BASE_RATE * Math.max(0.15, closeness) * lightFactor * moveFactor;
 }
 
-// One tick of guard behaviour. Returns an event string for sounds/HUD:
-// 'spotted' when a guard first turns suspicious, 'alarm' when one starts a
-// chase, 'lost' when a chase is given up, 'caught' when the player is taken.
-export function updateGuard(guard, player, grid, dt) {
-  let event = null;
-  const sees = guardSeesPlayer(guard, player, grid);
+function moveToward(guard, target, speed, dt) {
+  const dx = target.x - guard.x;
+  const dy = target.y - guard.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 2) return true;
+  const step = Math.min(dist, speed * dt);
+  guard.x += (dx / dist) * step;
+  guard.y += (dy / dist) * step;
+  turnToward(guard, Math.atan2(dy, dx), dt);
+  return dist - step < 2;
+}
 
-  if (sees) {
-    guard.lastSeen = { x: player.x, y: player.y };
-    guard.loseTimer = 0;
-    guard.awareness = Math.min(ALERT_AT, guard.awareness + detectionRate(guard, player, grid) * dt);
-    guard.facing = angleTo(guard.x, guard.y, player.x, player.y);
-  } else {
-    guard.awareness = Math.max(0, guard.awareness - DETECT_DECAY_RATE * dt);
-    if (guard.state === GUARD_STATE.CHASE) {
-      guard.loseTimer += dt;
-      if (guard.loseTimer > LOSE_TRACK_AFTER) {
-        guard.state = GUARD_STATE.SUSPICIOUS;
-        guard.lookTimer = 0;
-        event = 'lost';
-      }
-    }
-  }
+function nearestWaypointIndex(guard) {
+  let best = 0;
+  let bestDist = Infinity;
+  guard.waypoints.forEach((w, i) => {
+    const d = Math.hypot(w.x - guard.x, w.y - guard.y);
+    if (d < bestDist) { bestDist = d; best = i; }
+  });
+  return best;
+}
 
-  if (guard.awareness >= ALERT_AT && guard.state !== GUARD_STATE.CHASE) {
-    guard.state = GUARD_STATE.CHASE;
-    event = 'alarm';
-  } else if (
-    guard.awareness >= SUSPICIOUS_AT &&
-    guard.state === GUARD_STATE.PATROL &&
-    (guard.lastSeen || guard.lastHeard)
-  ) {
-    guard.state = GUARD_STATE.SUSPICIOUS;
-    guard.lookTimer = 0;
-    event = 'spotted';
-  }
+export function updateGuards(guards, dt, ctx) {
+  const { player, level, audio } = ctx;
+  let caught = false;
 
-  // Hearing: running feet nearby, or a pebble's clink, pull a patrolling
-  // guard over to listen — but hearing alone never starts a chase.
-  if (guard.state === GUARD_STATE.PATROL && player.noise) {
-    const d = Math.hypot(player.noise.x - guard.x, player.noise.y - guard.y);
-    const radius = player.noise.kind === 'pebble' ? HEAR_PEBBLE_RADIUS : HEAR_RUN_RADIUS;
-    if (d < radius) {
-      guard.lastHeard = { ...player.noise };
-      guard.state = GUARD_STATE.SUSPICIOUS;
-      guard.lookTimer = 0;
-      event = event ?? 'heard';
-    }
-  }
+  for (const guard of guards) {
+    const seen = guardSeesPlayer(guard, player, level);
+    const wasChasing = guard.state === 'chase';
 
-  if (guard.state === GUARD_STATE.PATROL) {
-    const target = guard.patrol[guard.waypoint];
-    const tx = (target.x + 0.5) * TILE;
-    const ty = (target.y + 0.5) * TILE;
-    if (guard.paused > 0) {
-      guard.paused -= dt;
-      guard.facing += dt * 0.7; // stand still and slowly scan the room
-    } else if (moveToward(guard, tx, ty, GUARD_PATROL_SPEED, dt)) {
-      guard.waypoint = (guard.waypoint + 1) % guard.patrol.length;
-      guard.paused = 1.2; // pause and look around at each waypoint
-    }
-  } else if (guard.state === GUARD_STATE.SUSPICIOUS) {
-    const target = guard.lastSeen ?? guard.lastHeard;
-    if (target) {
-      const arrived = moveToward(guard, target.x, target.y, GUARD_INVESTIGATE_SPEED, dt);
-      if (arrived) {
-        guard.lookTimer += dt;
-        // Scan the room: slow turn while looking for the intruder.
-        guard.facing += dt * 1.6;
-        if (guard.lookTimer > 2.4) {
-          guard.state = GUARD_STATE.PATROL;
-          guard.lastSeen = null;
-          guard.lastHeard = null;
-          guard.awareness = Math.max(0, guard.awareness - 30);
-        }
+    if (seen) {
+      guard.meter = Math.min(CHASE_AT, guard.meter + detectionRate(guard, player, level) * dt);
+      guard.lastSeen = { x: player.x, y: player.y };
+      guard.loseTimer = 0;
+      if (guard.meter >= CHASE_AT && guard.state !== 'chase') {
+        guard.state = 'chase';
+        audio.alert();
+      } else if (guard.meter >= SUSPICIOUS_AT && guard.state === 'patrol') {
+        guard.state = 'suspicious';
+        audio.suspicious();
       }
     } else {
-      guard.state = GUARD_STATE.PATROL;
+      const decay = guard.state === 'chase' ? CHASE_DECAY : DETECT_DECAY;
+      guard.meter = Math.max(0, guard.meter - decay * dt);
+      if (guard.state === 'chase') {
+        guard.loseTimer += dt;
+        if (guard.loseTimer > LOSE_SIGHT_SECONDS) {
+          guard.state = 'suspicious';
+          guard.loseTimer = 0;
+        }
+      } else if (guard.state === 'suspicious' && guard.meter < SUSPICIOUS_AT && !guard.lastSeen) {
+        guard.state = 'patrol';
+      }
     }
-  } else if (guard.state === GUARD_STATE.CHASE) {
-    moveToward(guard, player.x, player.y, GUARD_CHASE_SPEED, dt);
-    if (Math.hypot(player.x - guard.x, player.y - guard.y) < CATCH_DISTANCE) {
-      event = 'caught';
+
+    // A chasing guard that reaches the player ends the run.
+    if (guard.state === 'chase'
+      && Math.hypot(player.x - guard.x, player.y - guard.y) < 26) {
+      caught = true;
+    }
+
+    if (guard.state === 'patrol') {
+      if (guard.pauseTimer > 0) {
+        guard.pauseTimer -= dt;
+        guard.dir += dt * 0.7; // glance around while waiting
+      } else {
+        const target = guard.waypoints[guard.waypointIndex];
+        if (moveToward(guard, target, GUARD_PATROL_SPEED, dt)) {
+          guard.waypointIndex = (guard.waypointIndex + 1) % guard.waypoints.length;
+          guard.pauseTimer = 1.2;
+        }
+      }
+    } else if (guard.state === 'suspicious') {
+      if (guard.lastSeen) {
+        if (moveToward(guard, guard.lastSeen, GUARD_SUSPICIOUS_SPEED, dt)) {
+          guard.lookTimer += dt;
+          guard.dir += dt * 1.6; // scan the spot where the player was
+          if (guard.lookTimer > 2.2) {
+            guard.lookTimer = 0;
+            guard.lastSeen = null;
+            guard.waypointIndex = nearestWaypointIndex(guard);
+            guard.state = 'patrol';
+          }
+        }
+      } else {
+        guard.state = 'patrol';
+      }
+    } else if (guard.state === 'investigate') {
+      if (guard.investigateTarget) {
+        if (moveToward(guard, guard.investigateTarget, GUARD_SUSPICIOUS_SPEED, dt)) {
+          guard.lookTimer += dt;
+          guard.dir += dt * 1.8;
+          if (guard.lookTimer > 2.5) {
+            guard.lookTimer = 0;
+            guard.investigateTarget = null;
+            guard.waypointIndex = nearestWaypointIndex(guard);
+            guard.state = 'patrol';
+          }
+        }
+      } else {
+        guard.state = 'patrol';
+      }
+    } else if (guard.state === 'chase') {
+      moveToward(guard, player, GUARD_CHASE_SPEED, dt);
+    }
+
+    if (wasChasing && guard.state !== 'chase') {
+      // The chase cooled off; the meter keeps draining from here.
     }
   }
-
-  return event;
+  return caught;
 }
 
-// A player standing in a planter is hidden; anywhere else they are seen.
-export function playerIsHidden(player, grid) {
-  return isHidingTile(grid, Math.floor(player.x / TILE), Math.floor(player.y / TILE));
+// A noise (pebble clink, running feet) pulls nearby patrolling guards over.
+export function alertGuardsToNoise(guards, x, y, radius) {
+  for (const guard of guards) {
+    if (guard.state === 'chase') continue;
+    if (Math.hypot(guard.x - x, guard.y - y) > radius) continue;
+    guard.state = 'investigate';
+    guard.investigateTarget = { x, y };
+    guard.lookTimer = 0;
+    guard.meter = Math.max(guard.meter, 25);
+  }
 }
+
+// The points of one vision cone, raycast so walls cut the light short.
+export function conePolygon(guard, level) {
+  const rays = 26;
+  const points = [{ x: guard.x, y: guard.y }];
+  for (let i = 0; i <= rays; i += 1) {
+    const a = guard.dir - GUARD_VIEW_HALF_ANGLE
+      + (2 * GUARD_VIEW_HALF_ANGLE * i) / rays;
+    let reach = GUARD_VIEW_RANGE;
+    for (let d = 8; d <= GUARD_VIEW_RANGE; d += 8) {
+      if (isSolidPx(level, guard.x + Math.cos(a) * d, guard.y + Math.sin(a) * d)) {
+        reach = d;
+        break;
+      }
+    }
+    points.push({ x: guard.x + Math.cos(a) * reach, y: guard.y + Math.sin(a) * reach });
+  }
+  return points;
+}
+
+export { TILE };

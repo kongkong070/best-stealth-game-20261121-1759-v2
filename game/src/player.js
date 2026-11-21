@@ -1,98 +1,88 @@
-// Velvet Shadow — Wren, the player: movement, sneaking, running, hiding
-// and the pebble toss. The player is a circle that slides around walls.
+// Velvet Shadow — the burglar Wren: sneak, walk, run, toss pebbles.
+// Movement is axis-separated against the tile grid so Wren slides along
+// walls instead of sticking to them.
 import {
+  PEBBLE_RANGE,
+  PLAYER_RADIUS,
+  RUN_SPEED,
+  SNEAK_SPEED,
   TILE,
-  PLAYER_WALK_SPEED,
-  PLAYER_SNEAK_SPEED,
-  PLAYER_RUN_SPEED,
-  PEBBLES_START,
+  WALK_SPEED,
 } from './config.js';
-import { isSolidTile } from './level.js';
-import { playerIsHidden } from './guards.js';
+import { isSolidPx } from './level.js';
 
-export function makePlayer(start) {
+export function createPlayer(start) {
   return {
-    x: (start.x + 0.5) * TILE,
-    y: (start.y + 0.5) * TILE,
-    radius: 11,
-    facing: 0, // radians; the direction Wren last moved
+    x: start.x,
+    y: start.y,
+    dir: 0,
     moving: false,
     sneaking: false,
     running: false,
     hidden: false,
-    hasGem: false,
-    pebbles: PEBBLES_START,
-    noise: null, // {x, y, kind} set for one tick when feet or a pebble are loud
-    stepTimer: 0, // counts down to the next footstep sound
-    stepped: false, // set for one frame when a footstep lands
-    pebble: null, // a pebble in flight: {x, y, tx, ty, t}
+    pebbles: 5,
+    stepTimer: 0,
   };
 }
 
-function circleHitsWall(grid, x, y, radius) {
-  // Check the four corners of the circle's bounding box against solid tiles.
-  for (const [ox, oy] of [[-radius, -radius], [radius, -radius], [-radius, radius], [radius, radius]]) {
-    if (isSolidTile(grid, Math.floor((x + ox) / TILE), Math.floor((y + oy) / TILE))) return true;
-  }
-  return false;
+function canStand(level, x, y) {
+  const r = PLAYER_RADIUS - 1;
+  return !isSolidPx(level, x - r, y - r)
+    && !isSolidPx(level, x + r, y - r)
+    && !isSolidPx(level, x - r, y + r)
+    && !isSolidPx(level, x + r, y + r);
 }
 
-// Move with axis separation so Wren slides along walls instead of sticking.
-export function movePlayer(player, dx, dy, grid, dt) {
-  const speed = player.sneaking ? PLAYER_SNEAK_SPEED : player.running ? PLAYER_RUN_SPEED : PLAYER_WALK_SPEED;
-  const len = Math.hypot(dx, dy);
-  if (len < 0.01) {
-    player.moving = false;
-    return;
-  }
-  player.moving = true;
-  player.facing = Math.atan2(dy, dx);
-  const vx = (dx / len) * speed * dt;
-  const vy = (dy / len) * speed * dt;
-  if (!circleHitsWall(grid, player.x + vx, player.y, player.radius)) player.x += vx;
-  if (!circleHitsWall(grid, player.x, player.y + vy, player.radius)) player.y += vy;
-  // Footstep timing: a step fires every 0.42 s of moving. Only running feet
-  // are loud enough for guards to hear; walking and sneaking are quiet.
-  player.stepTimer -= dt * (player.running ? 2.2 : player.sneaking ? 0.7 : 1.3);
-  if (player.stepTimer <= 0) {
-    player.stepTimer = 0.42;
-    player.stepped = true; // main.js plays the footstep sound and clears this
-    player.noise = player.running ? { x: player.x, y: player.y, kind: 'run', loud: true } : null;
+export function updatePlayer(player, dt, input, level, events) {
+  const ix = (input.keys.has('KeyD') || input.keys.has('ArrowRight') ? 1 : 0)
+    - (input.keys.has('KeyA') || input.keys.has('ArrowLeft') ? 1 : 0);
+  const iy = (input.keys.has('KeyS') || input.keys.has('ArrowDown') ? 1 : 0)
+    - (input.keys.has('KeyW') || input.keys.has('ArrowUp') ? 1 : 0);
+  player.sneaking = input.keys.has('ShiftLeft') || input.keys.has('ShiftRight');
+  player.running = input.keys.has('Space') && !player.sneaking;
+  player.moving = ix !== 0 || iy !== 0;
+
+  const speed = player.sneaking ? SNEAK_SPEED : player.running ? RUN_SPEED : WALK_SPEED;
+  if (player.moving) {
+    const len = Math.hypot(ix, iy);
+    const vx = (ix / len) * speed * dt;
+    const vy = (iy / len) * speed * dt;
+    if (canStand(level, player.x + vx, player.y)) player.x += vx;
+    if (canStand(level, player.x, player.y + vy)) player.y += vy;
+    player.dir = Math.atan2(iy, ix);
+    // Footsteps: quiet while sneaking, loud and frequent while running.
+    player.stepTimer -= dt;
+    if (player.stepTimer <= 0) {
+      player.stepTimer = player.running ? 0.26 : player.sneaking ? 0.62 : 0.42;
+      events.push({ type: 'step', running: player.running, sneaking: player.sneaking });
+    }
+  } else {
+    player.stepTimer = 0;
   }
 }
 
-// Toss a pebble toward a point. It arcs for half a second, then clinks and
-// every nearby guard comes to look. Returns false when out of pebbles.
-export function tossPebble(player, tx, ty) {
-  if (player.pebbles <= 0 || player.pebble) return false;
+// A click tosses a pebble toward the mouse, up to PEBBLE_RANGE away; it
+// stops at the first wall in its path and clinks where it lands.
+export function throwPebble(player, level, mouse) {
+  if (player.pebbles <= 0) return null;
+  const dx = mouse.x - player.x;
+  const dy = mouse.y - player.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 8) return null;
+  const range = Math.min(PEBBLE_RANGE, dist);
+  let tx = player.x + (dx / dist) * range;
+  let ty = player.y + (dy / dist) * range;
+  for (let d = 8; d <= range; d += 8) {
+    const px = player.x + (dx / dist) * d;
+    const py = player.y + (dy / dist) * d;
+    if (isSolidPx(level, px, py)) {
+      tx = player.x + (dx / dist) * (d - 8);
+      ty = player.y + (dy / dist) * (d - 8);
+      break;
+    }
+  }
   player.pebbles -= 1;
-  const dist = Math.hypot(tx - player.x, ty - player.y);
-  const maxThrow = 260;
-  const k = dist > maxThrow ? maxThrow / dist : 1;
-  player.pebble = {
-    x: player.x,
-    y: player.y,
-    tx: player.x + (tx - player.x) * k,
-    ty: player.y + (ty - player.y) * k,
-    t: 0,
-  };
-  return true;
+  return { x0: player.x, y0: player.y, x1: tx, y1: ty, t: 0, landed: false };
 }
 
-export function updatePebble(player, dt) {
-  if (!player.pebble) return null;
-  const p = player.pebble;
-  p.t += dt / 0.45; // the toss takes 0.45 s
-  if (p.t >= 1) {
-    const landed = { x: p.tx, y: p.ty, kind: 'pebble', loud: true };
-    player.pebble = null;
-    player.noise = landed;
-    return landed;
-  }
-  return null;
-}
-
-// Refresh the hidden flag after a move: standing in a planter hides Wren.
-export function refreshHidden(player, grid) {
-  player.hidden = playerIsHidden(player, grid);
-}
+export { TILE };
