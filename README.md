@@ -1,8 +1,8 @@
 # Velvet Shadow
 
 [![make.fun](https://make.fun/badge/best-stealth-game-20261121-1759.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
-[![rank](https://make.fun/badge/best-stealth-game-20261121-1759/kongkong070/best-stealth-game-20261121-1759/rank.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
-[![reward](https://make.fun/badge/best-stealth-game-20261121-1759/kongkong070/best-stealth-game-20261121-1759/reward.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
+[![rank](https://make.fun/badge/best-stealth-game-20261121-1759/kongkong070/best-stealth-game-20261121-1759-v2/rank.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
+[![reward](https://make.fun/badge/best-stealth-game-20261121-1759/kongkong070/best-stealth-game-20261121-1759-v2/reward.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
 
 A top-down stealth game in a moonlit museum. You are **Wren**, a cat
 burglar with one job tonight: lift the **Ember Opal** and slip out the green
